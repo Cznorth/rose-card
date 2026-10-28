@@ -40,6 +40,11 @@ public class Hook implements IXposedHookLoadPackage {
     static Context app;
     static volatile int curType = T_STRONG;
     static volatile String mac, name;
+    /** 电量：左、右、盒，-1 未知；充电标志 */
+    static volatile int batL = -1, batR = -1, batBox = -1;
+    static volatile boolean chgL, chgR, chgBox;
+    static final String ACTION_BATTERY = "io.github.cznorth.rosecard.BATTERY";
+    static final String ROSELINK = "cn.ikaile.ruoshui.client";
 
     static void log(String s) { Log.i(TAG, s); XposedBridge.log(TAG + ": " + s); }
 
@@ -55,8 +60,29 @@ public class Hook implements IXposedHookLoadPackage {
                 if (app != null) return;
                 app = (Application) p.thisObject;
                 Handler h = new Handler(Looper.getMainLooper());
-                if (isMain) h.postDelayed(() -> readState(Hook::refresh), 12000);
-                else {
+                RoseBle.batteryListener = Hook::onBattery;
+                if (isMain) {
+                    h.postDelayed(Hook::poll, 12000);
+                    android.content.IntentFilter f = new android.content.IntentFilter();
+                    f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+                    f.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+                    app.registerReceiver(new android.content.BroadcastReceiver() {
+                        @Override public void onReceive(Context c, Intent i) {
+                            BluetoothDevice d = i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+                            if (d == null || !isRose(d)) return;
+                            boolean on = BluetoothDevice.ACTION_ACL_CONNECTED.equals(i.getAction());
+                            log("acl " + (on ? "connected" : "disconnected"));
+                            if (on) h.postDelayed(() -> readState(Hook::refresh), 4000);
+                            else remove();
+                        }
+                    }, f, Context.RECEIVER_EXPORTED);
+                    app.registerReceiver(new android.content.BroadcastReceiver() {
+                        @Override public void onReceive(Context c, Intent i) {
+                            setBattery(i.getIntArrayExtra("v"));
+                            refresh();
+                        }
+                    }, new android.content.IntentFilter(ACTION_BATTERY), Context.RECEIVER_NOT_EXPORTED);
+                } else {
                     android.content.IntentFilter f = new android.content.IntentFilter(ACTION_STATE);
                     app.registerReceiver(new android.content.BroadcastReceiver() {
                         @Override public void onReceive(Context c, Intent i) {
@@ -94,6 +120,167 @@ public class Hook implements IXposedHookLoadPackage {
                 }
             });
         } catch (Throwable t) { log("hook OneSpace failed " + t); }
+        if (isMain) return;
+        // 面板底部「立即连接」：ContentFragment.z(fragment, 连接状态)，2 = 已连接则隐藏
+        try {
+            Class<?> cf = cl.loadClass("com.oplus.melody.onespace.ContentFragment");
+            XposedHelpers.findAndHookMethod(cf, "z", cf, Integer.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    try {
+                        content = new java.lang.ref.WeakReference<>(p.args[0]);
+                        if (isRosePanel(p.args[0], "mAddress")) p.args[1] = 2;
+                    } catch (Throwable t) { log("ContentFragment.z " + t); }
+                }
+            });
+            XposedHelpers.findAndHookMethod(cf, "initView", android.view.View.class, new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    content = new java.lang.ref.WeakReference<>(p.thisObject);
+                    try { log("ContentFragment.initView rose=" + isRosePanel(p.thisObject, "mAddress")); } catch (Throwable ignored) {}
+                }
+            });
+        } catch (Throwable t) { log("hook ContentFragment failed " + t); }
+        // 电量：melody 自己推的（未连接/无数据）替换成 Rose 的
+        try {
+            XposedHelpers.findAndHookMethod("com.oplus.melody.onespace.items.OneSpaceHeaderPreference$initObserver$4",
+                    cl, "invoke", Object.class, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    try {
+                        Object f = panel == null ? null : panel.get();
+                        if (f == null || p.args[0] == ourBattery) return;
+                        if (getField(p.thisObject, "receiver") != getField(f, "x")) return;
+                        Object b = batteryVO();
+                        if (b != null) p.args[0] = b;
+                    } catch (Throwable t) { log("header$4 " + t); }
+                }
+            });
+        } catch (Throwable t) { log("hook header failed " + t); }
+        // 「耳机设置」→ RoseLink；「断开连接」→ 断开 Rose
+        try {
+            XposedHelpers.findAndHookMethod("androidx.preference.Preference", cl, "performClick", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    try {
+                        Object f = panel == null ? null : panel.get();
+                        if (f == null) return;
+                        Object pref = p.thisObject;
+                        if (pref == getField(f, "s")) { log("more setting -> RoseLink"); openRoseLink(f); p.setResult(null); }
+                        else if (pref == getField(f, "y")) { log("disconnect"); disconnect(f); p.setResult(null); }
+                    } catch (Throwable t) { log("performClick " + Log.getStackTraceString(t)); }
+                }
+            });
+        } catch (Throwable t) { log("hook performClick failed " + t); }
+    }
+
+    static java.lang.ref.WeakReference<Object> content;
+    static volatile Object ourBattery;
+
+    static boolean isRose(BluetoothDevice d) {
+        String n = d.getName();
+        return d.getAddress().toUpperCase().endsWith("CD:8D") || (n != null && n.contains("EarFeel"));
+    }
+    static boolean isRosePanel(Object o, String field) throws Exception {
+        if (mac == null) { BluetoothDevice d = findRose(); if (d != null) mac = d.getAddress(); }
+        Object m = getField(o, field);
+        return mac != null && m instanceof String && mac.equalsIgnoreCase((String) m);
+    }
+    static Object activityOf(Object fragment) throws Exception {
+        Method m = null;
+        for (Class<?> c = fragment.getClass(); c != null && m == null; c = c.getSuperclass())
+            try { m = c.getDeclaredMethod("getActivity"); } catch (NoSuchMethodException ignored) {}
+        if (m == null) return null;
+        m.setAccessible(true);
+        return m.invoke(fragment);
+    }
+    static void openRoseLink(Object f) throws Exception {
+        android.app.Activity a = (android.app.Activity) activityOf(f);
+        Context c = a != null ? a : app;
+        // 欢律没声明 <queries>，查不到 RoseLink；显式组件启动不受包可见性限制
+        Intent it = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                .setClassName(ROSELINK, ROSELINK + ".MainActivity")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        try { c.startActivity(it); }
+        catch (Throwable t) { log("start RoseLink failed " + t); return; }
+        if (a != null) a.finish();
+    }
+    /** 同欢律自己的做法：经 HFP / A2DP profile 代理反射调用 disconnect(device)；失败则打开蓝牙设置。 */
+    static void disconnect(Object f) throws Exception {
+        android.app.Activity a = (android.app.Activity) activityOf(f);
+        BluetoothDevice d = findRose();
+        BluetoothManager bm = app.getSystemService(BluetoothManager.class);
+        BluetoothAdapter ad = bm == null ? null : bm.getAdapter();
+        if (d == null || ad == null) { openBtSettings(a); return; }
+        final int[] left = {2};
+        final boolean[] ok = {false};
+        for (int prof : new int[]{android.bluetooth.BluetoothProfile.HEADSET, android.bluetooth.BluetoothProfile.A2DP}) {
+            ad.getProfileProxy(app, new android.bluetooth.BluetoothProfile.ServiceListener() {
+                @Override public void onServiceConnected(int pf, android.bluetooth.BluetoothProfile proxy) {
+                    try {
+                        Object r = proxy.getClass().getMethod("disconnect", BluetoothDevice.class).invoke(proxy, d);
+                        log("profile " + pf + " disconnect -> " + r);
+                        if (Boolean.TRUE.equals(r)) ok[0] = true;
+                    } catch (Throwable t) { log("profile " + pf + " disconnect failed " + (t.getCause() != null ? t.getCause() : t)); }
+                    ad.closeProfileProxy(pf, proxy);
+                    if (--left[0] == 0) {
+                        if (!ok[0]) openBtSettings(a);
+                        if (a != null) a.finish();
+                    }
+                }
+                @Override public void onServiceDisconnected(int pf) {}
+            }, prof);
+        }
+    }
+    static void openBtSettings(android.app.Activity a) {
+        Context c = a != null ? a : app;
+        try { c.startActivity(new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); }
+        catch (Throwable t) { log("bt settings " + t); }
+    }
+
+    /** 电量 payload → batL/batR/batBox（布局见 README）。 */
+    static void onBattery(byte[] p) {
+        // payload 7 字节：?? ?? 左 右 左充电? 右充电? 盒（ff = 未知）
+        if (p.length < 7) return;
+        int[] v = {p[2] & 0xff, p[3] & 0xff, p[6] & 0xff, p[4], p[5], 0};
+        setBattery(v);
+        log("battery L=" + batL + (chgL ? "+" : "") + " R=" + batR + (chgR ? "+" : "") + " box=" + batBox + (chgBox ? "+" : ""));
+        if (!isMain && app != null) {
+            app.sendBroadcast(new Intent(ACTION_BATTERY).setPackage(MELODY).putExtra("v", v));
+            new Handler(Looper.getMainLooper()).post(Hook::fillPanel);
+        }
+    }
+    static void setBattery(int[] v) {
+        if (v == null || v.length < 6) return;
+        batL = v[0] <= 100 ? v[0] : -1; batR = v[1] <= 100 ? v[1] : -1; batBox = v[2] <= 100 ? v[2] : -1;
+        chgL = v[3] != 0; chgR = v[4] != 0; chgBox = v[5] != 0;
+    }
+    static Object batteryVO() throws Exception {
+        if (batL < 0 && batR < 0) return null;
+        Object b = make("P9.a", "mConnectionState", 2, "mHeadsetConnectionState", 2,
+                "mLeftBattery", batL, "mRightBattery", batR, "mBoxBattery", batBox,
+                "mHeadsetLeftBattery", batL, "mHeadsetRightBattery", batR, "mHeadsetBoxBattery", batBox,
+                "mIsLeftCharging", chgL, "mIsRightCharging", chgR, "mIsBoxCharging", chgBox,
+                "mIsSpp", false, "mType", "");
+        ourBattery = b;
+        return b;
+    }
+
+    /** 主进程：Rose 连着就读一次状态和电量并刷新卡片，每 10 分钟一次。 */
+    static void poll() {
+        try {
+            BluetoothDevice d = findRose();
+            boolean conn = false;
+            if (d != null) try { conn = (Boolean) BluetoothDevice.class.getMethod("isConnected").invoke(d); } catch (Throwable t) { conn = true; }
+            log("poll connected=" + conn);
+            if (conn) readState(Hook::refresh);
+        } catch (Throwable t) { log("poll " + t); }
+        new Handler(Looper.getMainLooper()).postDelayed(Hook::poll, 10 * 60 * 1000);
+    }
+
+    static synchronized void remove() {
+        try {
+            if (mac == null) return;
+            if (name == null) name = mac;
+            insert(build(), "g");
+            log("card removed");
+        } catch (Throwable t) { log("remove " + Log.getStackTraceString(t)); }
     }
 
     static java.lang.ref.WeakReference<Object> panel;
@@ -165,7 +352,16 @@ public class Hook implements IXposedHookLoadPackage {
                         "mNoiseReductionUIVersion", 0);
                 invoke1(fnRef("com.oplus.melody.onespace.items.OneSpaceNoisePreference$initObserver$1", pref), nvo);
             }
-            log("panel filled, cur=" + curType);
+            Object hdr = getField(f, "x"), bvo = batteryVO();
+            if (hdr != null && bvo != null)
+                invoke1(fnRef("com.oplus.melody.onespace.items.OneSpaceHeaderPreference$initObserver$4", hdr), bvo);
+            Object cf = content == null ? null : content.get();
+            if (cf != null && isRosePanel(cf, "mAddress")) {
+                Method z = cf.getClass().getDeclaredMethod("z", cf.getClass(), Integer.class);
+                z.setAccessible(true);
+                z.invoke(null, cf, 2);
+            }
+            log("panel filled, cur=" + curType + " bat=" + batL + "/" + batR + "/" + batBox + " content=" + (cf != null));
         } catch (Throwable t) { log("fillPanel " + Log.getStackTraceString(t)); }
     }
 
@@ -250,7 +446,7 @@ public class Hook implements IXposedHookLoadPackage {
             ble.readLevel((lv, err2) -> {
                 if (err2 == null) curType = typeOf(m, lv);
                 log("readState mode=" + m + " level=" + lv + " -> " + curType);
-                then.run();
+                ble.readBattery((n, err3) -> { if (err3 != null) log("readBattery err=" + err3); then.run(); });
             });
         });
     }
@@ -262,7 +458,7 @@ public class Hook implements IXposedHookLoadPackage {
             mac = d.getAddress();
             String alias = d.getAlias();
             name = alias != null ? alias : d.getName();
-            insert(build());
+            insert(build(), "h");
         } catch (Throwable t) { log("refresh " + Log.getStackTraceString(t)); }
     }
 
@@ -280,8 +476,6 @@ public class Hook implements IXposedHookLoadPackage {
          .put("data", "").put("iconUrl", "").put("mIconUrl", "").put("videoUrl", "");
         j.put("connection", new JSONObject().put("connectState", "CONNECTED")
                 .put("lastConnectTime", now).put("lastDisconnectTime", 0));
-        JSONArray bat = new JSONArray();   // TODO: 读真实电量（01 01 通知）
-        j.put("batteryInfoList", bat).put("mBatteryList", bat);
 
         JSONObject act = new JSONObject().put("mDeviceId", id).put("mMenuActionType", "activity")
                 .put("mMenuIntentPackage", "cn.ikaile.ruoshui.client")
@@ -317,17 +511,44 @@ public class Hook implements IXposedHookLoadPackage {
         return j;
     }
 
-    static void insert(JSONObject j) throws Exception {
-        Class<?> di = cl.loadClass("com.oplus.mydevices.sdk.device.DeviceInfo");
-        Class<?> gsonC = cl.loadClass("com.google.gson.Gson");
-        Object gson = gsonC.getConstructor().newInstance();
-        Method fj = null;
-        for (Method m : gsonC.getMethods()) {
-            Class<?>[] pt = m.getParameterTypes();
-            if (pt.length == 2 && pt[0] == String.class && (pt[1] == Class.class || pt[1] == java.lang.reflect.Type.class) && m.getReturnType() == Object.class) { fj = m; break; }
+    static Object gson; static Method fj;
+    static Object gsonFrom(String js, java.lang.reflect.Type t) throws Exception {
+        if (fj == null) {
+            Class<?> gsonC = cl.loadClass("com.google.gson.Gson");
+            gson = gsonC.getConstructor().newInstance();
+            for (Method m : gsonC.getMethods()) {
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 2 && pt[0] == String.class && (pt[1] == Class.class || pt[1] == java.lang.reflect.Type.class) && m.getReturnType() == Object.class) { fj = m; break; }
+            }
+            if (fj == null) throw new NoSuchMethodException("Gson.fromJson(String,Class)");
         }
-        if (fj == null) throw new NoSuchMethodException("Gson.fromJson(String,Class)");
-        Object info = fj.invoke(gson, "{}", di);
+        return fj.invoke(gson, js, t);
+    }
+
+    static java.util.ArrayList<Object> batteryList() throws Exception {
+        java.util.ArrayList<Object> l = new java.util.ArrayList<>();
+        Class<?> bi = cl.loadClass("com.oplus.mydevices.sdk.device.BatteryInfo");
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        Class<Enum> bt = (Class<Enum>) cl.loadClass("com.oplus.mydevices.sdk.device.BatteryType");
+        String[] types = {"LEFT", "RIGHT", "BOX"};
+        int[] vals = {batL, batR, batBox};
+        boolean[] chg = {chgL, chgR, chgBox};
+        for (int i = 0; i < 3; i++) {
+            if (vals[i] < 0) continue;
+            Object b = bi.getConstructor().newInstance();
+            bi.getMethod("setBatteryType", bt).invoke(b, Enum.valueOf(bt, types[i]));
+            bi.getMethod("setValue", int.class).invoke(b, vals[i]);
+            bi.getMethod("setCharge", boolean.class).invoke(b, chg[i]);
+            l.add(b);
+        }
+        return l;
+    }
+
+    /** op: "h" 插入/更新，"g" 删除。 */
+    static void insert(JSONObject j, String op) throws Exception {
+        Class<?> di = cl.loadClass("com.oplus.mydevices.sdk.device.DeviceInfo");
+        Object info = gsonFrom("{}", di);
+        Method fj = Hook.fj;
         for (java.util.Iterator<String> it = j.keys(); it.hasNext(); ) {
             String k = it.next();
             java.lang.reflect.Field f;
@@ -337,14 +558,13 @@ public class Hook implements IXposedHookLoadPackage {
             String js = raw instanceof String ? JSONObject.quote((String) raw) : String.valueOf(raw);
             f.set(info, fj.invoke(gson, js, f.getGenericType()));
         }
+        java.util.ArrayList<Object> bl = batteryList();
+        setField(info, "batteryInfoList", bl);
+        // mBatteryList 元素类型不是 BatteryInfo，填了宿主解析失败；只填 batteryInfoList
         Class<?> mgr = cl.loadClass("com.oplus.mydevices.sdk.DeviceInfoManager");
-        StringBuilder ms = new StringBuilder();
-        for (Method m : mgr.getDeclaredMethods())
-            if (Modifier.isStatic(m.getModifiers())) ms.append(m.getName()).append(java.util.Arrays.toString(m.getParameterTypes())).append(' ');
-        log("DeviceInfoManager statics: " + ms);
-        Method h = mgr.getDeclaredMethod("h", di);
+        Method h = mgr.getDeclaredMethod(op, di);
         h.setAccessible(true);
         h.invoke(null, info);
-        log("inserted " + info);
+        log((op.equals("g") ? "deleted " : "inserted ") + info);
     }
 }

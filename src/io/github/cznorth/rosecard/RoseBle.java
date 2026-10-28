@@ -75,6 +75,25 @@ public final class RoseBle {
         run(() -> { byte[] p = new byte[4]; p[m] = 1; txn(0x06, 0x82, p); return m; }, cb);
     }
 
+    /** 电量帧 01 01 的 payload（读回包或耳机主动通知）。 */
+    public interface BatteryListener { void onBattery(byte[] p); }
+    public static volatile BatteryListener batteryListener;
+    public void readBattery(Cb cb) {
+        run(() -> txn(0x01, 0x01, null).length, cb);   // 结果经 batteryListener 送出
+    }
+    static void notifyBattery(byte[] p) {
+        Log.i(TAG, "battery " + hex(p));
+        BatteryListener l = batteryListener;
+        if (l != null) try { l.onBattery(p); } catch (Throwable t) { Log.w(TAG, "battery cb", t); }
+    }
+    static byte[] payload(byte[] rx) {
+        int plen = ((rx[7] & 0xff) | ((rx[8] & 0xff) << 8)) - 10;
+        if (plen < 0 || 9 + plen > rx.length) plen = Math.max(0, rx.length - 10);
+        byte[] p = new byte[plen];
+        System.arraycopy(rx, 9, p, 0, plen);
+        return p;
+    }
+
     interface Op { int call() throws Exception; }
 
     private void run(Op op, Cb cb) {
@@ -198,7 +217,10 @@ public final class RoseBle {
         }
 
         @Override public void onCharacteristicChanged(BluetoothGatt g, BluetoothGattCharacteristic c, byte[] v) {
-            if (c.getInstanceId() == H_NOTIFY) rxQ.offer(v);
+            if (c.getInstanceId() != H_NOTIFY) return;
+            rxQ.offer(v);
+            if (v.length >= 10 && (v[0] & 0xff) == 0x09 && (v[1] & 0xff) == 0xff && v[5] == 1 && v[6] == 1
+                    && (v[4] & 0xff) == 1) notifyBattery(payload(v));   // 读回包与主动通知同格式
         }
     };
 }
