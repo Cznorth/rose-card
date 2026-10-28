@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Rose 耳机卡片</string>
+    <string name="desc">把 Rose EarFeel-i5 接入 ColorOS 原生耳机卡片（hook 欢律）</string>
+    <string-array name="scope"><item>com.oplus.melody</item></string-array>
+</resources>
