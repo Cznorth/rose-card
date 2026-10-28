@@ -174,8 +174,7 @@ public class Hook implements IXposedHookLoadPackage {
     static volatile Object ourBattery;
 
     static boolean isRose(BluetoothDevice d) {
-        String n = d.getName();
-        return d.getAddress().toUpperCase().endsWith("CD:8D") || (n != null && n.contains("EarFeel"));
+        return isRoseName(d.getName());
     }
     static boolean isRosePanel(Object o, String field) throws Exception {
         if (mac == null) { BluetoothDevice d = findRose(); if (d != null) mac = d.getAddress(); }
@@ -414,9 +413,16 @@ public class Hook implements IXposedHookLoadPackage {
         if (ad == null || !ad.isEnabled()) return null;
         for (BluetoothDevice d : ad.getBondedDevices()) {
             String n = d.getName();
-            if (d.getAddress().toUpperCase().endsWith("CD:8D") || (n != null && n.contains("EarFeel"))) return d;
+            if (isRoseName(n)) return d;
         }
         return null;
+    }
+
+    /** 经典蓝牙名为「ROSE EARFREE i5」（也兼容 EarFeel 写法） */
+    static boolean isRoseName(String n) {
+        if (n == null) return false;
+        String u = n.toUpperCase();
+        return u.startsWith("ROSE") && (u.contains("EARFREE") || u.contains("EARFEEL"));
     }
 
     static String str(String n) {

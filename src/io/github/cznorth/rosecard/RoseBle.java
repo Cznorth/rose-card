@@ -30,7 +30,6 @@ import java.util.concurrent.TimeUnit;
  */
 public final class RoseBle {
     static final String TAG = "RoseCard";
-    static final String DEFAULT_ADDR = "D2:02:03:05:CD:8D";
     static final int H_WRITE = 0x000e, H_NOTIFY = 0x0010;
     static final UUID CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
@@ -166,8 +165,9 @@ public final class RoseBle {
         BluetoothManager bm = ctx.getSystemService(BluetoothManager.class);
         BluetoothAdapter ad = bm == null ? null : bm.getAdapter();
         if (ad == null || !ad.isEnabled()) throw new Exception("蓝牙未开启");
-        String addr = DEFAULT_ADDR;
-        BluetoothDevice dev = ad.getRemoteLeDevice(addr, BluetoothDevice.ADDRESS_TYPE_RANDOM);
+        BluetoothDevice bonded = Hook.findRose();
+        if (bonded == null) throw new Exception("未找到已配对的 Rose 耳机");
+        BluetoothDevice dev = ad.getRemoteLeDevice(bonded.getAddress(), BluetoothDevice.ADDRESS_TYPE_RANDOM);
         connQ.clear();
         gatt = dev.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE);
         Object o = connQ.poll(8, TimeUnit.SECONDS);
