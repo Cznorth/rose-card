@@ -167,10 +167,21 @@ public final class RoseBle {
         if (ad == null || !ad.isEnabled()) throw new Exception("蓝牙未开启");
         BluetoothDevice bonded = Hook.findRose();
         if (bonded == null) throw new Exception("未找到已配对的 Rose 耳机");
-        BluetoothDevice dev = ad.getRemoteLeDevice(bonded.getAddress(), BluetoothDevice.ADDRESS_TYPE_RANDOM);
+        // 耳机是双模设备，BLE 用与经典蓝牙相同的公共地址（RoseLink 也是 addressType=0）；
+        // 按随机地址连会一直超时/133，只有 RoseLink 已建好 LE 链路时才碰巧能复用成功。
+        Exception last = null;
+        for (BluetoothDevice dev : new BluetoothDevice[]{bonded,
+                ad.getRemoteLeDevice(bonded.getAddress(), BluetoothDevice.ADDRESS_TYPE_RANDOM)}) {
+            try { connectOnce(dev); return; }
+            catch (Exception e) { last = e; Log.w(TAG, "connect " + dev + " failed: " + e.getMessage()); close(); }
+        }
+        throw last;
+    }
+
+    private void connectOnce(BluetoothDevice dev) throws Exception {
         connQ.clear();
         gatt = dev.connectGatt(ctx, false, cb, BluetoothDevice.TRANSPORT_LE);
-        Object o = connQ.poll(8, TimeUnit.SECONDS);
+        Object o = connQ.poll(10, TimeUnit.SECONDS);
         if (o == null) throw new Exception("连接耳机超时");
         if (o instanceof Exception) throw (Exception) o;
         ready = true;

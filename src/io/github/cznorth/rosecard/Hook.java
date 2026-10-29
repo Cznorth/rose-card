@@ -32,7 +32,10 @@ public class Hook implements IXposedHookLoadPackage {
 
     /** 卡片模式类型（melody 定义）→ 资源名后缀 / 图标名 */
     static final int T_CLOSE = 1, T_TRANS = 2, T_WEAK = 3, T_STRONG = 4, T_MID = 5;
-    static final int[] TYPES = {T_CLOSE, T_TRANS, T_WEAK, T_MID, T_STRONG};
+    /** 10 在欢律里是「自适应」，借来当 Rose 的透风（防风降噪）模式（面板文案由 hook 替换） */
+    static final int T_WIND = 10;
+    static final String WIND_LABEL = "透风";
+    static final int[] TYPES = {T_CLOSE, T_TRANS, T_WEAK, T_MID, T_STRONG, T_WIND};
 
     static final String ACTION_STATE = "io.github.cznorth.rosecard.STATE";
     static boolean isMain;
@@ -70,6 +73,9 @@ public class Hook implements IXposedHookLoadPackage {
                         @Override public void onReceive(Context c, Intent i) {
                             BluetoothDevice d = i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
                             if (d == null || !isRose(d)) return;
+                            // 只认经典蓝牙链路；BLE 控制链路（本模块或 RoseLink 建的）断开不代表耳机断开
+                            int tr = i.getIntExtra(BluetoothDevice.EXTRA_TRANSPORT, BluetoothDevice.TRANSPORT_AUTO);
+                            if (tr == BluetoothDevice.TRANSPORT_LE) { log("acl le ignored"); return; }
                             boolean on = BluetoothDevice.ACTION_ACL_CONNECTED.equals(i.getAction());
                             log("acl " + (on ? "connected" : "disconnected"));
                             if (on) h.postDelayed(() -> readState(Hook::refresh), 4000);
@@ -112,7 +118,7 @@ public class Hook implements IXposedHookLoadPackage {
                         String m = (String) getField(f, "z");
                         if (mac == null) { BluetoothDevice d = findRose(); if (d != null) { mac = d.getAddress(); name = d.getAlias() != null ? d.getAlias() : d.getName(); } }
                         log("OneSpace onViewCreated match=" + (mac != null && mac.equalsIgnoreCase(m)));
-                        if (mac == null || !mac.equalsIgnoreCase(m)) return;
+                        if (mac == null || !mac.equalsIgnoreCase(m)) { panel = null; return; }
                         panel = new java.lang.ref.WeakReference<>(f);
                         new Handler(Looper.getMainLooper()).postDelayed(Hook::fillPanel, 300);
                         readState(() -> new Handler(Looper.getMainLooper()).post(Hook::fillPanel));
@@ -121,6 +127,16 @@ public class Hook implements IXposedHookLoadPackage {
             });
         } catch (Throwable t) { log("hook OneSpace failed " + t); }
         if (isMain) return;
+        // 面板降噪按钮：类型 10 欢律显示「自适应」，Rose 面板上改成「透风」
+        try {
+            XposedHelpers.findAndHookMethod("com.oplus.melody.onespace.items.OneSpaceNoisePreference", cl, "i",
+                    Context.class, int.class, android.graphics.drawable.Drawable.class, String.class, boolean.class,
+                    new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if ((Integer) p.args[1] == T_WIND && panel != null && panel.get() != null) p.args[3] = WIND_LABEL;
+                }
+            });
+        } catch (Throwable t) { log("hook noise item failed " + t); }
         // 面板底部「立即连接」：ContentFragment.z(fragment, 连接状态)，2 = 已连接则隐藏
         try {
             Class<?> cf = cl.loadClass("com.oplus.melody.onespace.ContentFragment");
@@ -375,6 +391,7 @@ public class Hook implements IXposedHookLoadPackage {
             if (v instanceof String && ((String) v).contains("\"type\"")) json = (String) v;
         }
         log(sb.toString());
+        if (mac == null) { BluetoothDevice d = findRose(); if (d != null) { mac = d.getAddress(); name = d.getAlias() != null ? d.getAlias() : d.getName(); } }
         if (json == null || mac == null) return false;
         JSONObject j = new JSONObject(json);
         if (!mac.equalsIgnoreCase(j.optString("mac"))) return false;
@@ -384,13 +401,14 @@ public class Hook implements IXposedHookLoadPackage {
     }
 
     static void apply(int type) {
-        int mode, level = -1;           // Rose: mode 0 降噪 1 普通 2 风噪 3 通透；level 0 轻 1 中 2 深
+        int mode, level = -1;           // Rose: mode 0 降噪 1 普通 2 防风降噪 3 通透；level 0 轻 1 中 2 深
         switch (type) {
             case T_CLOSE: mode = 1; break;
             case T_TRANS: mode = 3; break;
             case T_WEAK: mode = 0; level = 0; break;
             case T_MID: mode = 0; level = 1; break;
             case T_STRONG: mode = 0; level = 2; break;
+            case T_WIND: mode = 2; break;
             default: log("unknown type " + type); return;
         }
         final int lv = level;
@@ -441,7 +459,8 @@ public class Hook implements IXposedHookLoadPackage {
         if (mode == 1) return T_CLOSE;
         if (mode == 3) return T_TRANS;
         if (mode == 0) return level == 0 ? T_WEAK : level == 1 ? T_MID : T_STRONG;
-        return -1;   // 风噪等，卡片上不选中
+        if (mode == 2) return T_WIND;
+        return -1;
     }
 
     /** 从耳机读模式与强度，更新 curType 后执行 then（BLE 线程）。 */
@@ -499,9 +518,10 @@ public class Hook implements IXposedHookLoadPackage {
                 case T_TRANS: label = "pass_through_reduction"; icon = "transparent"; break;
                 case T_WEAK: label = "weak_reduction"; icon = "weak"; break;
                 case T_MID: label = "reduction"; icon = "strong"; break;
+                case T_WIND: label = null; icon = "adaptive"; break;
                 default: label = "strong_reduction"; icon = "strong"; break;
             }
-            String nm = str("melody_mydevices_noise_reduction_action_" + label);
+            String nm = label == null ? WIND_LABEL : str("melody_mydevices_noise_reduction_action_" + label);
             String extra = new JSONObject().put("type", t).put("mac", mac).put("product_name", name)
                     .put("product_id", "rose").toString();
             String link = "melody://com.oplus.melody/headset?type=" + t + "&protocol=" + t + "&mac=" + mac;

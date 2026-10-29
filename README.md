@@ -5,7 +5,7 @@ LSPosed 模块：把 **Rose EarFeel i5（蓝牙名 ROSE EARFREE i5）** 接入 C
 ## 功能
 
 - 控制中心出现 Rose 设备卡片，带左右耳电量环；耳机断开时卡片自动消失，连上后自动出现
-- 卡片/面板里点降噪模式直接生效：普通、通透、降噪（轻度/中度/深度三档对应 ColorOS 的弱/中/强降噪）
+- 卡片/面板里点降噪模式直接生效：普通、通透、降噪（轻度/中度/深度三档对应 ColorOS 的弱/中/强降噪）、透风（防风降噪）
 - OneSpace 面板显示左右耳电量（充电仓电量需开盒时才有）
 - 面板「耳机设置」跳转 RoseLink，「断开连接」真正断开耳机
 
@@ -38,7 +38,7 @@ LSPosed 模块：把 **Rose EarFeel i5（蓝牙名 ROSE EARFREE i5）** 接入 C
 - 连接：面板底部「立即连接」由 `ContentFragment.z(fragment, 2)` 隐藏；主进程监听 ACL，断开时 `DeviceInfoManager.g` 删卡、连上时重读并插入；每 10 分钟轮询一次
 - 「耳机设置」→ 显式组件启动 RoseLink（欢律无 `<queries>`；ColorOS 会弹关联启动确认）
 - 「断开连接」→ 同欢律做法，HFP/A2DP profile 代理反射 `disconnect(device)`；失败则打开蓝牙设置
-- 模式映射：1 关闭→普通，2 通透，3 弱降噪→降噪+轻度，5 降噪→降噪+中度，4 强降噪→降噪+深度
+- 模式映射：1 关闭→普通，2 通透，3 弱降噪→降噪+轻度，5 降噪→降噪+中度，4 强降噪→降噪+深度，10 自适应→透风（Rose 防风降噪模式；hook `OneSpaceNoisePreference.i` 把面板文案「自适应」换成「透风」）
 
 构建：`./build.sh`（Windows 侧 SDK，无 Gradle；Xposed API 用 `stubs/` 桩类编译、不打包）。
 混淆名绑定欢律 17.6.3，欢律更新后需重新核对。
